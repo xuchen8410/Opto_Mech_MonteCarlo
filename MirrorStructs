@@ -1,0 +1,415 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from numba import njit, prange
+import time
+
+# ============================================================
+# TMA single-mirror "base mount error" -> Zernike WFE model
+#   - 3-point mount pad height errors (µm-scale) -> rigid body (piston/tilt)
+#   - plus mount print-through -> low-order surface figure (astig, defocus, coma-ish)
+#   - Convert to WFE (reflection => WFE = 2 * surface sag)
+#   - Express in Noll Zernike coefficients (waves @ wavelength)
+#   - Keep plots similar: hist(Z5), hist(Z6), scatter(Z5 vs Z6), hist(RMS WFE)
+#   - Quick visualization: mirror sag before/after for round or square mirror
+# ============================================================
+
+# -----------------------------
+# Zernike (Noll) helpers (low order, unit disk, orthonormal-ish)
+# We only need: Z2, Z3, Z4, Z5, Z6, Z7, Z8 (tilt/defocus/astig/coma)
+# Definitions follow the common Noll set:
+#   Z2 = 2*rho*cos(theta)            (X-tilt)
+#   Z3 = 2*rho*sin(theta)            (Y-tilt)
+#   Z4 = sqrt(3)*(2*rho^2 - 1)       (Defocus)
+#   Z5 = sqrt(6)*rho^2*sin(2theta)   (Astig @ 45)
+#   Z6 = sqrt(6)*rho^2*cos(2theta)   (Astig @ 0)
+#   Z7 = sqrt(8)*(3*rho^3 - 2*rho)*sin(theta) (Coma Y)
+#   Z8 = sqrt(8)*(3*rho^3 - 2*rho)*cos(theta) (Coma X)
+#
+# Coefficients "c_j" in meters correspond to WFE over unit pupil:
+#   W(rho,theta) = Σ c_j * Z_j(rho,theta)
+# For these Noll polynomials, RMS(W) over unit disk ≈ sqrt(Σ c_j^2)
+# (assuming orthonormalization as above).
+# -----------------------------
+
+@njit
+def _solve_plane_from_3pads(x1, y1, z1, x2, y2, z2, x3, y3, z3):
+    """
+    Fit plane z = a + b*x + c*y through 3 points exactly.
+    Returns (a,b,c).
+    """
+    # Solve linear system:
+    # [1 x1 y1][a] = [z1]
+    # [1 x2 y2][b]   [z2]
+    # [1 x3 y3][c]   [z3]
+    det = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1)
+    if np.abs(det) < 1e-20:
+        return 0.0, 0.0, 0.0
+
+    b = ((z2 - z1) * (y3 - y1) - (z3 - z1) * (y2 - y1)) / det
+    c = (-(z2 - z1) * (x3 - x1) + (z3 - z1) * (x2 - x1)) / det
+    a = z1 - b * x1 - c * y1
+    return a, b, c
+
+
+@njit
+def _mount_to_zernike_coeff_m(
+    h1_m, h2_m, h3_m,
+    r_support_m,
+    pupil_radius_m,
+    k_print_astig,     # dimensionless-ish scale for print-through astig per pad differential
+    k_print_defocus,   # scale for print-through defocus per mean pad height (imperfect bedding)
+    k_print_coma       # scale for coma-ish term per 1st-order imbalance
+):
+    """
+    Convert 3 pad height errors (meters) into WFE Zernike coefficients c_j (meters).
+    Assumptions:
+      - Pads at 120 deg on radius r_support.
+      - Rigid body plane from pads => piston + tilts.
+      - Additional print-through surface figure terms (astig/defocus/coma) derived from
+        simple combinations of pad heights (heuristic but realistic enough for trade studies).
+      - Reflection: WFE = 2 * sag.
+
+    Returns:
+      c2,c3,c4,c5,c6,c7,c8 in meters (WFE).
+    """
+
+    # Pad coordinates
+    # pad1 at 0 deg, pad2 at 120 deg, pad3 at 240 deg
+    x1, y1 = r_support_m, 0.0
+    x2, y2 = -0.5 * r_support_m,  (np.sqrt(3) / 2.0) * r_support_m
+    x3, y3 = -0.5 * r_support_m, -(np.sqrt(3) / 2.0) * r_support_m
+
+    # Exact plane through pad heights -> rigid body sag model
+    a, b, c = _solve_plane_from_3pads(x1, y1, h1_m, x2, y2, h2_m, x3, y3, h3_m)
+
+    # For small tilts, W(x,y) = 2*(b*x + c*y + a) on the surface; piston ignored usually.
+    # Map to Z2/Z3:
+    #   W = (tx*R)*rho*cos + (ty*R)*rho*sin with tx=b, ty=c for sag plane
+    # But Z2=2*rho*cos, Z3=2*rho*sin, so:
+    #   c2 = ( (2*b)*R )/2 = b*R
+    #   c3 = ( (2*c)*R )/2 = c*R
+    # (Factor 2 from reflection already included as 2*b; cancels /2)
+    c2 = b * pupil_radius_m
+    c3 = c * pupil_radius_m
+
+    # Heuristic print-through terms (surface figure) from pad height combinations:
+    # Mean and imbalance components
+    h_mean = (h1_m + h2_m + h3_m) / 3.0
+
+    # Two independent "120-deg" imbalance components (orthogonal) for astig-like patterns
+    # Think of these as projections onto cos(2θ)/sin(2θ)-like symmetry.
+    # These combos are common in 3-support analysis (up to a scale).
+    dA = (2.0 * h1_m - h2_m - h3_m)  # aligns with pad1 axis
+    dB = (h2_m - h3_m)              # quadrature axis
+
+    # A "1st-order" imbalance that can leak into coma-ish term if the base is not kinematic
+    dC = (h1_m + h2_m - 2.0 * h3_m)
+
+    # Convert to WFE coefficients (meters):
+    # - Defocus: bedding/compliance can make average pad height change sag curvature.
+    # - Astig: differential support height/force print-through.
+    # - Coma: asymmetric constraint or off-axis stiffness coupling.
+    #
+    # IMPORTANT: These are *engineering trade-study* knobs, not an FEA replacement.
+    # Tune k_* to match your mount design / prior analysis.
+    #
+    # Convert sag->WFE with factor 2 (reflection)
+    c4 = 2.0 * (k_print_defocus * h_mean)                 # defocus WFE coeff (m)
+    c6 = 2.0 * (k_print_astig * dA)                       # astig 0
+    c5 = 2.0 * (k_print_astig * (np.sqrt(3) * dB))        # astig 45 (scaled)
+    c8 = 2.0 * (k_print_coma  * dC)                       # coma X-ish
+    c7 = 0.0                                              # coma Y left as 0 unless you add another asymmetry
+
+    return c2, c3, c4, c5, c6, c7, c8
+
+
+@njit(parallel=True)
+def mc_mount_to_zernike(
+    h1_m, h2_m, h3_m,
+    r_support_m,
+    pupil_radius_m,
+    wavelength_m,
+    k_print_astig,
+    k_print_defocus,
+    k_print_coma,
+    remove_tilt=True
+):
+    """
+    Monte-Carlo mapping of mount pad errors -> Zernike coeffs (waves) and RMS WFE.
+    Returns:
+      z5_waves, z6_waves, wfe_rms_waves, tilt_mag_urad
+    """
+    N = h1_m.shape[0]
+    z5 = np.empty(N, dtype=np.float64)
+    z6 = np.empty(N, dtype=np.float64)
+    wfe_rms = np.empty(N, dtype=np.float64)
+    tilt_mag_urad = np.empty(N, dtype=np.float64)
+
+    inv_lam = 1.0 / wavelength_m
+
+    for i in prange(N):
+        c2, c3, c4, c5, c6, c7, c8 = _mount_to_zernike_coeff_m(
+            h1_m[i], h2_m[i], h3_m[i],
+            r_support_m,
+            pupil_radius_m,
+            k_print_astig,
+            k_print_defocus,
+            k_print_coma
+        )
+
+        # Convert to waves
+        z5[i] = c5 * inv_lam
+        z6[i] = c6 * inv_lam
+
+        # Small-angle tilt (radians) from plane slope on surface:
+        # sag plane z = a + b*x + c*y => slopes b,c (rad approx)
+        # WFE doesn't directly equal pointing, but it's a useful proxy for "tilt magnitude".
+        # Note: reflection doubles beam angle, but here we just report surface slope magnitude.
+        # If you want beam steering, multiply by 2.
+        # We can estimate tx=b, ty=c by re-solving plane quickly from c2,c3:
+        # since c2 = b*R => b = c2/R; same for c3.
+        b = c2 / pupil_radius_m
+        c = c3 / pupil_radius_m
+        tilt_mag_urad[i] = np.sqrt(b*b + c*c) * 1e6
+
+        # RMS WFE (waves). For the listed Noll Zernikes, RMS ≈ sqrt(sum c_j^2)/λ
+        # Often you remove piston/tilt in wavefront budgets.
+        if remove_tilt:
+            s = c4*c4 + c5*c5 + c6*c6 + c7*c7 + c8*c8
+        else:
+            s = c2*c2 + c3*c3 + c4*c4 + c5*c5 + c6*c6 + c7*c7 + c8*c8
+
+        wfe_rms[i] = np.sqrt(s) * inv_lam
+
+    return z5, z6, wfe_rms, tilt_mag_urad
+
+
+# -----------------------------
+# Quick visualization (mirror sag) before/after
+# Supports "circle" or "square" physical mirror.
+# We visualize SURFACE SAG (nm), not WFE. (WFE = 2*sag for reflection)
+# -----------------------------
+def make_mirror_grid(shape="circle", n=301):
+    # Normalized physical mirror coordinates in [-1,1]
+    x = np.linspace(-1.0, 1.0, n)
+    y = np.linspace(-1.0, 1.0, n)
+    X, Y = np.meshgrid(x, y)
+    if shape.lower() == "circle":
+        mask = (X*X + Y*Y) <= 1.0
+    elif shape.lower() == "square":
+        mask = (np.abs(X) <= 1.0) & (np.abs(Y) <= 1.0)
+    else:
+        raise ValueError("shape must be 'circle' or 'square'")
+    return X, Y, mask
+
+
+def surface_sag_from_coeffs(X, Y, mask, pupil_radius_m, c2, c3, c4, c5, c6, c7, c8):
+    """
+    Build surface sag (meters) on a physical mirror grid.
+    We assume the *optical pupil* is defined by pupil_radius_m, but for visualization we
+    simply map normalized [-1,1] coords to physical pupil coords: x=R*X, y=R*Y.
+    IMPORTANT: Coeffs here are WFE coeffs (meters). For reflection: WFE=2*sag => sag = WFE/2.
+    """
+    # physical coords (meters) over pupil scale
+    x = pupil_radius_m * X
+    y = pupil_radius_m * Y
+
+    # Convert to normalized polar over unit disk for Zernikes
+    rho = np.sqrt(X*X + Y*Y)
+    theta = np.arctan2(Y, X)
+
+    # Zernike values (unit disk); outside disk will be masked anyway for circle pupil
+    # For square mirror, you may still see values beyond rho>1; we mask by 'mask' only.
+    Z2 = 2.0 * rho * np.cos(theta)
+    Z3 = 2.0 * rho * np.sin(theta)
+    Z4 = np.sqrt(3.0) * (2.0 * rho*rho - 1.0)
+    Z5 = np.sqrt(6.0) * (rho*rho) * np.sin(2.0 * theta)
+    Z6 = np.sqrt(6.0) * (rho*rho) * np.cos(2.0 * theta)
+    Z7 = np.sqrt(8.0) * (3.0*rho*rho*rho - 2.0*rho) * np.sin(theta)
+    Z8 = np.sqrt(8.0) * (3.0*rho*rho*rho - 2.0*rho) * np.cos(theta)
+
+    W_wfe = (c2*Z2 + c3*Z3 + c4*Z4 + c5*Z5 + c6*Z6 + c7*Z7 + c8*Z8)  # meters (WFE)
+    sag = 0.5 * W_wfe  # reflection: WFE = 2*sag
+
+    sag_plot = np.full_like(sag, np.nan)
+    sag_plot[mask] = sag[mask]
+    return sag_plot
+
+
+def quick_before_after_plot(shape, pupil_radius_m, coeffs_before, coeffs_after, title_suffix=""):
+    X, Y, mask = make_mirror_grid(shape=shape, n=301)
+
+    sag0 = surface_sag_from_coeffs(X, Y, mask, pupil_radius_m, *coeffs_before)
+    sag1 = surface_sag_from_coeffs(X, Y, mask, pupil_radius_m, *coeffs_after)
+    dsag = sag1 - sag0
+
+    # scale to nm
+    sag0_nm = sag0 * 1e9
+    sag1_nm = sag1 * 1e9
+    dsag_nm = dsag * 1e9
+
+    fig = plt.figure(figsize=(12, 4))
+    ax1 = plt.subplot(1, 3, 1)
+    im1 = ax1.imshow(sag0_nm, origin="lower", extent=[-1, 1, -1, 1])
+    ax1.set_title(f"Surface sag (nm) BEFORE\n{shape}{title_suffix}")
+    ax1.set_xlabel("X (norm)")
+    ax1.set_ylabel("Y (norm)")
+    plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = plt.subplot(1, 3, 2)
+    im2 = ax2.imshow(sag1_nm, origin="lower", extent=[-1, 1, -1, 1])
+    ax2.set_title("Surface sag (nm) AFTER")
+    ax2.set_xlabel("X (norm)")
+    ax2.set_ylabel("Y (norm)")
+    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = plt.subplot(1, 3, 3)
+    im3 = ax3.imshow(dsag_nm, origin="lower", extent=[-1, 1, -1, 1])
+    ax3.set_title("Δ sag (nm) AFTER - BEFORE")
+    ax3.set_xlabel("X (norm)")
+    ax3.set_ylabel("Y (norm)")
+    plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    return fig
+
+
+def main():
+    # -----------------------------
+    # User-tunable parameters (TMA mirror-ish)
+    # -----------------------------
+    N = 200_000
+
+    # Optics
+    wavelength_m = 633e-9         # change as needed (e.g., 193e-9)
+    pupil_radius_m = 0.020        # 40 mm CA -> R=20 mm (example)
+    r_support_m = 0.030           # 3-pad radius (often > CA radius for mirror back support)
+
+    # Mount error distributions (pad height / bedding errors)
+    # Interpret these as "effective pad height error" including base machining, shim error, preload settling.
+    sigma_h_um = 3.0              # 1-sigma pad height error in microns (tune)
+    mu_h_um = 0.0
+
+    # Print-through coupling knobs (trade-study parameters):
+    # These scale how much pad error leaks into *figure* beyond rigid-body plane.
+    # Typical ranges (very design dependent): 0.01 ~ 0.3
+    k_print_astig = 0.08          # astig WFE per differential pad height
+    k_print_defocus = 0.02        # defocus WFE per mean pad height
+    k_print_coma = 0.01           # coma WFE per asymmetry term
+
+    # Whether to remove tilts from RMS WFE
+    remove_tilt = True
+
+    # Mirror visualization: physical mirror shape
+    mirror_shape = "circle"       # "circle" or "square"
+
+    # -----------------------------
+    # Monte-Carlo inputs
+    # -----------------------------
+    rng = np.random.default_rng(7)
+
+    h1_um = rng.normal(mu_h_um, sigma_h_um, size=N)
+    h2_um = rng.normal(mu_h_um, sigma_h_um, size=N)
+    h3_um = rng.normal(mu_h_um, sigma_h_um, size=N)
+
+    # Convert to meters
+    h1_m = h1_um * 1e-6
+    h2_m = h2_um * 1e-6
+    h3_m = h3_um * 1e-6
+
+    # -----------------------------
+    # Run MC
+    # -----------------------------
+    t0 = time.time()
+    z5_waves, z6_waves, wfe_rms_waves, tilt_mag_urad = mc_mount_to_zernike(
+        h1_m, h2_m, h3_m,
+        r_support_m,
+        pupil_radius_m,
+        wavelength_m,
+        k_print_astig,
+        k_print_defocus,
+        k_print_coma,
+        remove_tilt=remove_tilt
+    )
+    t1 = time.time()
+
+    def stats(x):
+        return np.mean(x), np.std(x), np.percentile(x, [50, 95, 99])
+
+    m5, s5, p5 = stats(z5_waves)
+    m6, s6, p6 = stats(z6_waves)
+    mr, sr, pr = stats(wfe_rms_waves)
+    mt, st, pt = stats(tilt_mag_urad)
+
+    print("Runtime (sec):", (t1 - t0))
+    print(f"Z5 (Astig 45) waves: mean={m5:.3e}, std={s5:.3e}, p50/p95/p99={p5}")
+    print(f"Z6 (Astig 0 ) waves: mean={m6:.3e}, std={s6:.3e}, p50/p95/p99={p6}")
+    print(f"RMS WFE waves (tilt {'removed' if remove_tilt else 'included'}): mean={mr:.3e}, std={sr:.3e}, p50/p95/p99={pr}")
+    print(f"Surface slope magnitude proxy (urad): mean={mt:.3f}, std={st:.3f}, p50/p95/p99={pt}")
+
+    # -----------------------------
+    # Plots (same structure idea)
+    # -----------------------------
+    fig1 = plt.figure()
+    plt.hist(z5_waves, bins=120, density=True)
+    plt.xlabel("Z5 coefficient (waves @ λ)")
+    plt.ylabel("PDF")
+    plt.title("Monte-Carlo: Z5 (Astig 45) distribution")
+    plt.tight_layout()
+
+    fig2 = plt.figure()
+    plt.hist(z6_waves, bins=120, density=True)
+    plt.xlabel("Z6 coefficient (waves @ λ)")
+    plt.ylabel("PDF")
+    plt.title("Monte-Carlo: Z6 (Astig 0) distribution")
+    plt.tight_layout()
+
+    fig3 = plt.figure()
+    idx = np.linspace(0, N - 1, 8000).astype(np.int64)
+    plt.scatter(z5_waves[idx], z6_waves[idx], s=6, alpha=0.35)
+    plt.xlabel("Z5 (waves @ λ)")
+    plt.ylabel("Z6 (waves @ λ)")
+    plt.title("Z5 vs Z6 (astig coupling cloud)")
+    plt.tight_layout()
+
+    fig4 = plt.figure()
+    plt.hist(wfe_rms_waves, bins=120, density=True)
+    plt.xlabel("RMS WFE (waves @ λ)")
+    plt.ylabel("PDF")
+    plt.title(f"RMS WFE distribution (tilt {'removed' if remove_tilt else 'included'})")
+    plt.tight_layout()
+
+    # -----------------------------
+    # Quick "before/after" mirror sag visualization
+    # Choose a representative "bad" case (e.g., ~99th percentile RMS)
+    # -----------------------------
+    target = np.percentile(wfe_rms_waves, 99)
+    k = int(np.argmin(np.abs(wfe_rms_waves - target)))
+
+    # Build coeffs (meters) for that sample
+    c2, c3, c4, c5, c6, c7, c8 = _mount_to_zernike_coeff_m(
+        h1_m[k], h2_m[k], h3_m[k],
+        r_support_m,
+        pupil_radius_m,
+        k_print_astig,
+        k_print_defocus,
+        k_print_coma
+    )
+
+    # BEFORE: perfect (all zero)
+    coeffs_before = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    # AFTER: this MC draw
+    coeffs_after = (c2, c3, c4, c5, c6, c7, c8)
+
+    title_suffix = f"\n(sample ~99% RMS, h=[{h1_um[k]:.2f},{h2_um[k]:.2f},{h3_um[k]:.2f}] µm)"
+    quick_before_after_plot(
+        mirror_shape, pupil_radius_m,
+        coeffs_before, coeffs_after,
+        title_suffix=title_suffix
+    )
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
